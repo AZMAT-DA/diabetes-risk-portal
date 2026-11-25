@@ -1,0 +1,52 @@
+{
+  "ensemble_cv": {
+    "accuracy": {
+      "mean": 0.7617,
+      "std": 0.0127
+    },
+    "recall": {
+      "mean": 0.6045,
+      "std": 0.0179
+    },
+    "precision": {
+      "mean": 0.6792,
+      "std": 0.0311
+    },
+    "f1": {
+      "mean": 0.6391,
+      "std": 0.0156
+    },
+    "roc_auc": {
+      "mean": 0.8287,
+      "std": 0.0196
+    }
+  },
+  "baseline_logreg_cv": {
+    "accuracy": {
+      "mean": 0.7734,
+      "std": 0.0133
+    },
+    "recall": {
+      "mean": 0.5711,
+      "std": 0.0481
+    },
+    "precision": {
+      "mean": 0.73,
+      "std": 0.0591
+    },
+    "f1": {
+      "mean": 0.637,
+      "std": 0.0147
+    },
+    "roc_auc": {
+      "mean": 0.8359,
+      "std": 0.0196
+    }
+  },
+  "holdout": {
+    "accuracy": 0.7468,
+    "recall": 0.5185,
+    "roc_auc": 0.8198
+  },
+  "n_rows": 768
+}

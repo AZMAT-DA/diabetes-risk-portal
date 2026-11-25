@@ -1,0 +1,20 @@
+# Python cache
+__pycache__/
+*.pyc
+
+# Local database (contains user accounts and health inputs)
+*.db
+
+# Virtual environments
+.venv/
+venv/
+
+# Notebook auto-saves
+.ipynb_checkpoints/
+
+# Secrets (for later, if you add API keys)
+.env
+
+# Windows / editor files
+Thumbs.db
+.DS_Store
