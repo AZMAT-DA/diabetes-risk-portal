@@ -223,7 +223,8 @@ def fetch_user_assessments(session_user: dict, limit: int = 25) -> pd.DataFrame:
         if session_user.get("id") is not None:
             rows = conn.execute(
                 """
-                SELECT created_at, glucose, bmi, age, probability, risk_tier, prediction
+                SELECT created_at, glucose, blood_pressure, insulin, bmi, age,
+                       probability, risk_tier, prediction
                 FROM assessments
                 WHERE user_id = ?
                 ORDER BY id DESC
@@ -245,6 +246,93 @@ def fetch_user_assessments(session_user: dict, limit: int = 25) -> pd.DataFrame:
         return pd.DataFrame([dict(r) for r in rows])
     finally:
         conn.close()
+
+
+def fetch_latest_assessment(user_id: int) -> dict | None:
+    """Most recent saved assessment of this account (call BEFORE saving the new one)."""
+    conn = get_db_connection()
+    try:
+        row = conn.execute(
+            """
+            SELECT created_at, glucose, blood_pressure, insulin, bmi,
+                   probability, risk_tier
+            FROM assessments
+            WHERE user_id = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (user_id,),
+        ).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+# Change in estimated risk (percentage points) needed to call it better/worse.
+# Smaller changes are treated as normal noise.
+RISK_CHANGE_THRESHOLD = 3.0
+
+# (column, label, unit, smallest meaningful change, lower_is_better or None)
+COMPARE_FIELDS = [
+    ("glucose", "Glucose", "mg/dL", 3.0, True),
+    ("bmi", "BMI", "", 0.3, True),
+    ("blood_pressure", "Blood pressure", "mm Hg", 3.0, True),
+    ("insulin", "Insulin", "mu U/ml", 5.0, None),  # no good/bad verdict
+]
+
+
+def compare_with_previous(previous: dict, inputs: dict, prob: float, tier: str) -> dict:
+    """Compare the new assessment with the previous saved one."""
+    risk_delta = (prob - float(previous["probability"])) * 100.0
+    if risk_delta <= -RISK_CHANGE_THRESHOLD:
+        verdict = "improved"
+    elif risk_delta >= RISK_CHANGE_THRESHOLD:
+        verdict = "worse"
+    else:
+        verdict = "similar"
+
+    key_for = {
+        "glucose": "Glucose",
+        "bmi": "BMI",
+        "blood_pressure": "BloodPressure",
+        "insulin": "Insulin",
+    }
+    rows = []
+    unreliable = False
+    for column, label, unit, tolerance, lower_is_better in COMPARE_FIELDS:
+        old_value = float(previous[column] or 0)
+        new_value = float(inputs[key_for[column]])
+        if old_value == 0 or new_value == 0:
+            unreliable = True
+        change = new_value - old_value
+        if abs(change) < tolerance:
+            note = "No real change"
+        elif lower_is_better is None:
+            note = "Changed"
+        elif (change < 0) == lower_is_better:
+            note = "✅ Better"
+        else:
+            note = "⚠️ Higher" if lower_is_better else "⚠️ Lower"
+        rows.append(
+            {
+                "Measure": f"{label} {('(' + unit + ')') if unit else ''}".strip(),
+                "Previous": round(old_value, 1),
+                "Now": round(new_value, 1),
+                "Change": f"{change:+.1f}",
+                "Result": note,
+            }
+        )
+    return {
+        "verdict": verdict,
+        "risk_delta": risk_delta,
+        "old_prob": float(previous["probability"]),
+        "new_prob": prob,
+        "old_tier": previous["risk_tier"],
+        "new_tier": tier,
+        "previous_date": str(previous["created_at"])[:16],
+        "rows": rows,
+        "unreliable": unreliable,
+    }
 
 
 def fetch_all_assessments() -> pd.DataFrame:
@@ -565,6 +653,11 @@ def main() -> None:
             prob = float(pipeline.predict_proba(engineer_features(row_df))[0][1])
             pred = int(prob >= 0.50)
             tier_label, badge_type, summary_text = classify_risk_tier(prob)
+            comparison = None
+            if current_user.get("id") is not None:
+                previous = fetch_latest_assessment(current_user["id"])
+                if previous:
+                    comparison = compare_with_previous(previous, input_map, prob, tier_label)
             save_assessment_record(current_user, input_map, prob, tier_label, pred)
             st.session_state["last_prediction"] = {
                 "prob": prob,
@@ -574,6 +667,8 @@ def main() -> None:
                 "summary_text": summary_text,
                 "row_df": row_df,
                 "impacts": explain_prediction(pipeline, row_df, medians),
+                "comparison": comparison,
+                "first_record": current_user.get("id") is not None and comparison is None,
             }
 
         if "last_prediction" in st.session_state:
@@ -587,6 +682,40 @@ def main() -> None:
             st.markdown(res["summary_text"])
             st.progress(min(max(res["prob"], 0.0), 1.0), text=f"Chance of Diabetes: {res['prob']:.1%}")
             st.dataframe(res["row_df"], width="stretch")
+
+            cmp = res.get("comparison")
+            if cmp:
+                st.subheader("Your progress since the last check")
+                summary = (
+                    f"Estimated risk: **{cmp['old_prob']:.1%} → {cmp['new_prob']:.1%}** "
+                    f"({cmp['risk_delta']:+.1f} points) compared with your check on "
+                    f"{cmp['previous_date']}."
+                )
+                if cmp["verdict"] == "improved":
+                    st.success("### 📉 You improved\n" + summary)
+                elif cmp["verdict"] == "worse":
+                    st.error("### 📈 Your risk went up\n" + summary)
+                else:
+                    st.info("### ➡️ About the same\n" + summary)
+                if cmp["old_tier"] != cmp["new_tier"]:
+                    st.markdown(f"Risk tier changed: **{cmp['old_tier']} → {cmp['new_tier']}**")
+                st.dataframe(pd.DataFrame(cmp["rows"]), hide_index=True, width="stretch")
+                if cmp["unreliable"]:
+                    st.warning(
+                        "One of the values was 0 (unknown) in this or the previous check, "
+                        "so this comparison may be unreliable."
+                    )
+                st.caption(
+                    f"A change smaller than {RISK_CHANGE_THRESHOLD:.0f} percentage points is "
+                    "treated as normal variation, not a real improvement or decline."
+                )
+            elif res.get("first_record"):
+                st.info(
+                    "This is your first saved check. Come back later and check again, "
+                    "and the app will show whether you improved."
+                )
+            elif current_user.get("id") is None:
+                st.info("Register an account to save your results and track your progress over time.")
 
             st.subheader("Why this result?")
             impacts = res["impacts"]
@@ -616,6 +745,14 @@ def main() -> None:
         if hist_df.empty:
             st.info("No saved records yet.")
         else:
+            if current_user.get("id") is not None and len(hist_df) >= 2:
+                st.markdown("**Your estimated risk over time (%)**")
+                trend = hist_df.copy()
+                trend["created_at"] = pd.to_datetime(trend["created_at"])
+                trend["Risk (%)"] = trend["probability"] * 100
+                st.line_chart(trend.sort_values("created_at").set_index("created_at")["Risk (%)"])
+            elif current_user.get("id") is not None:
+                st.caption("Make at least two checks to see your progress chart.")
             st.dataframe(hist_df, width="stretch")
 
     with tab_stats:
